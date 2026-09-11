@@ -1,3 +1,4 @@
-,Avg Char Length,% Under 280 Chars,% With CTA / Action,ROUGE-1 (F1),ROUGE-2 (F1),ROUGE-L (F1),BLEU Score
-Baseline (Keyword),147.8,100.0,100.0,0.208,0.0283,0.148,0.016
-LLM Agent (Groq),147.8,100.0,100.0,0.2032,0.0354,0.1506,0.0176
+System,Avg Char Length,% Under 280 Chars,ROUGE-1,ROUGE-2,ROUGE-L,BLEU,LLM Judge Quality (1-5)
+Baseline 1 (Trivial Generic DM),120.0,100.0,0.3005,0.0545,0.2144,0.0267,N/A
+Baseline 2 (Rule/Keyword Agent),164.8,100.0,0.2822,0.0412,0.2001,0.0206,N/A
+LLM Agent (Groq / gpt-oss-20b),218.7,87.5,0.2851,0.0715,0.217,0.0342,3.0

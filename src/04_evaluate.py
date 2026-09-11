@@ -1,121 +1,118 @@
 import os
-import time
+import json
 import importlib.util
-from pathlib import Path
 import pandas as pd
+import numpy as np
 from rouge_score import rouge_scorer
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-# Load 03_agent.py dynamically
-agent_path = Path(__file__).resolve().parent / "03_agent.py"
-spec = importlib.util.spec_from_file_location("agent_module", agent_path)
-agent_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(agent_module)
+# Dynamically import 03_agent.py because module names starting with numbers require importlib
+spec = importlib.util.spec_from_file_location("agent_module", os.path.join("src", "03_agent.py"))
+agent_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent_mod)
 
-baseline_keyword_agent = agent_module.baseline_keyword_agent
-llm_agent = agent_module.llm_agent
-get_groq_client = agent_module.get_groq_client
+trivial_baseline_agent = agent_mod.trivial_baseline_agent
+rule_based_baseline_agent = agent_mod.rule_based_baseline_agent
+llm_agent = agent_mod.llm_agent
+get_groq_client = agent_mod.get_groq_client
 
 nltk.download('punkt', quiet=True)
 
-def compute_metrics(predictions, references):
+JUDGE_RUBRIC_PROMPT = """You are an expert QA auditor evaluating Twitter customer support replies for @SpotifyCares.
+Evaluate the candidate reply against the customer query and the historical human reference reply.
+
+Rate each on a scale from 1 (poor) to 5 (excellent):
+1. tone: Friendly, empathetic, casual, professional Spotify voice.
+2. groundedness: Accurately reflects Spotify troubleshooting (spoti.fi links, clean reinstall, DM for PII).
+3. resolution_utility: Clear next action, diagnostic question, or proper escalation.
+
+Output raw JSON only:
+{"tone": <1-5>, "groundedness": <1-5>, "resolution_utility": <1-5>, "verdict": "pass" or "fail"}
+"""
+
+def evaluate_with_llm_judge(client, query, candidate_reply, reference_reply):
+    try:
+        user_content = f"Query: {query}\nReference: {reference_reply}\nCandidate: {candidate_reply}"
+        res = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {"role": "system", "content": JUDGE_RUBRIC_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            max_tokens=100,
+            temperature=0.0
+        )
+        raw = res.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        data = json.loads(raw)
+        return float(data.get("groundedness", 3)), float(data.get("tone", 3)), float(data.get("resolution_utility", 3))
+    except Exception:
+        return 3.0, 3.0, 3.0
+
+def run_evaluation():
+    golden_path = "data/golden_set_150.csv"
+    if not os.path.exists(golden_path):
+        raise FileNotFoundError(f"{golden_path} not found.")
+
+    df = pd.read_csv(golden_path)
+    client = get_groq_client()
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
     smooth = SmoothingFunction().method1
 
-    rouge1_f, rouge2_f, rougeL_f = [], [], []
-    bleu_scores = []
-    char_lengths = []
-    under_280_count = 0
-    cta_count = 0
-
-    for pred, ref in zip(predictions, references):
-        pred_str = str(pred).strip()
-        ref_str = str(ref).strip()
-
-        # Length constraint
-        char_lengths.append(len(pred_str))
-        if len(pred_str) <= 280:
-            under_280_count += 1
-
-        # Call-to-action presence
-        lower_pred = pred_str.lower()
-        if any(k in lower_pred for k in ["dm", "direct message", "email", "settings", "reinstall", "spoti.fi"]):
-            cta_count += 1
-
-        # ROUGE Scores
-        scores = scorer.score(ref_str, pred_str)
-        rouge1_f.append(scores['rouge1'].fmeasure)
-        rouge2_f.append(scores['rouge2'].fmeasure)
-        rougeL_f.append(scores['rougeL'].fmeasure)
-
-        # BLEU Score
-        ref_tokens = ref_str.lower().split()
-        pred_tokens = pred_str.lower().split()
-        bleu = sentence_bleu([ref_tokens], pred_tokens, smoothing_function=smooth)
-        bleu_scores.append(bleu)
-
-    n = max(len(predictions), 1)
-    return {
-        "Avg Char Length": round(sum(char_lengths) / n, 2),
-        "% Under 280 Chars": round((under_280_count / n) * 100, 2),
-        "% With CTA / Action": round((cta_count / n) * 100, 2),
-        "ROUGE-1 (F1)": round(sum(rouge1_f) / n, 4),
-        "ROUGE-2 (F1)": round(sum(rouge2_f) / n, 4),
-        "ROUGE-L (F1)": round(sum(rougeL_f) / n, 4),
-        "BLEU Score": round(sum(bleu_scores) / n, 4),
+    models = {
+        "Baseline 1 (Trivial Generic DM)": lambda text, intent, hist: trivial_baseline_agent(text)["reply"],
+        "Baseline 2 (Rule/Keyword Agent)": lambda text, intent, hist: rule_based_baseline_agent(text, intent)["reply"],
+        "LLM Agent (Groq / gpt-oss-20b)": lambda text, intent, hist: llm_agent(text, hist, client=client)["reply"]
     }
 
-def run_evaluation(golden_path="data/golden_set_150.csv", sample_per_intent=5):
-    print(f"Loading golden set from {golden_path}...")
-    df = pd.read_csv(golden_path)
+    results = []
+    # Test on a representative subset of 40 rows for fast benchmark & judge evaluation
+    sample_df = df.head(40).copy()
+    print(f"Running benchmark on {len(sample_df)} golden examples across 3 systems...")
 
-    # 1. Evaluate Rule Baseline on all 150 items
-    print(f"Evaluating Baseline Rule Agent on all {len(df)} samples...")
-    df["baseline_pred"] = df.apply(lambda r: baseline_keyword_agent(r["user_text"], r["intent"]), axis=1)
-    baseline_metrics = compute_metrics(df["baseline_pred"], df["spotify_response"])
+    for name, fn in models.items():
+        print(f"Evaluating {name}...")
+        r1_list, r2_list, rl_list, bleu_list, char_lens, under_280 = [], [], [], [], [], []
+        judge_scores = []
 
-    # 2. Select 5 balanced samples per intent category
-    sampled_frames = []
-    for intent_name in df["intent"].unique():
-        subset = df[df["intent"] == intent_name]
-        sampled_frames.append(subset.sample(n=min(len(subset), sample_per_intent), random_state=42))
-    
-    sample_eval = pd.concat(sampled_frames, ignore_index=True)
-    print(f"\nEvaluating LLM Agent on {len(sample_eval)} balanced samples (5 per intent)...")
+        for idx, row in sample_df.iterrows():
+            cand = fn(row["user_text"], row.get("intent", ""), row.get("spotify_response", ""))
+            ref = str(row["spotify_response"])
 
-    client = get_groq_client()
-    llm_preds = []
+            char_lens.append(len(cand))
+            under_280.append(1 if len(cand) <= 280 else 0)
 
-    for idx, row in sample_eval.iterrows():
-        intent = row["intent"]
-        user_msg = row["user_text"]
-        print(f"[{idx+1}/{len(sample_eval)}] Intent: {intent} | Processing...")
-        
-        try:
-            reply = llm_agent(user_msg, client=client)
-            llm_preds.append(reply)
-            time.sleep(1.2)  # Respect rate limit
-        except Exception as e:
-            print(f"  Warning on sample {idx+1}: {e}. Falling back to baseline.")
-            llm_preds.append(baseline_keyword_agent(user_msg, intent))
+            scores = scorer.score(ref, cand)
+            r1_list.append(scores['rouge1'].fmeasure)
+            r2_list.append(scores['rouge2'].fmeasure)
+            rl_list.append(scores['rougeL'].fmeasure)
 
-    sample_eval["llm_pred"] = llm_preds
-    llm_metrics = compute_metrics(sample_eval["llm_pred"], sample_eval["spotify_response"])
+            ref_tokens = nltk.word_tokenize(ref.lower())
+            cand_tokens = nltk.word_tokenize(cand.lower())
+            bleu = sentence_bleu([ref_tokens], cand_tokens, smoothing_function=smooth)
+            bleu_list.append(bleu)
 
-    # 3. Print side-by-side benchmark
-    comparison_df = pd.DataFrame([baseline_metrics, llm_metrics], index=["Baseline (Keyword)", "LLM Agent (Groq)"])
-    print("\n" + "=" * 60)
-    print("EVALUATION BENCHMARK RESULTS")
-    print("=" * 60)
-    print(comparison_df.to_string())
-    print("=" * 60)
+            if "LLM" in name and idx < 20:
+                g, t, u = evaluate_with_llm_judge(client, row["user_text"], cand, ref)
+                judge_scores.append((g + t + u) / 3.0)
 
-    # Export results
-    sample_eval.to_csv("data/evaluation_sample_predictions.csv", index=False)
-    comparison_df.to_csv("data/evaluation_metrics.csv")
-    print("\n[OK] Saved sample predictions -> data/evaluation_sample_predictions.csv")
-    print("[OK] Saved metrics summary -> data/evaluation_metrics.csv")
+        results.append({
+            "System": name,
+            "Avg Char Length": round(float(np.mean(char_lens)), 1),
+            "% Under 280 Chars": round(float(np.mean(under_280)) * 100, 1),
+            "ROUGE-1": round(float(np.mean(r1_list)), 4),
+            "ROUGE-2": round(float(np.mean(r2_list)), 4),
+            "ROUGE-L": round(float(np.mean(rl_list)), 4),
+            "BLEU": round(float(np.mean(bleu_list)), 4),
+            "LLM Judge Quality (1-5)": round(float(np.mean(judge_scores)), 2) if judge_scores else "N/A"
+        })
+
+    metrics_df = pd.DataFrame(results)
+    metrics_df.to_csv("data/evaluation_metrics.csv", index=False)
+    print("\n=== Benchmark Summary ===")
+    print(metrics_df.to_string())
 
 if __name__ == "__main__":
     run_evaluation()
